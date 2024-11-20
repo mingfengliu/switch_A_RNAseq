@@ -1,0 +1,674 @@
+---
+title: "LINC00667_LRT_platinum_filter"
+author: "ML"
+date: "2024-11_19"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(bitmapType = "cairo")
+library(IRanges)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(purrr)
+library(magrittr)
+library(pheatmap)
+library(Rcpp)
+library(DESeq2)
+library(tibble)
+library(rmarkdown)
+library(MatrixGenerics)
+library(ggrepel)
+```
+
+#GFP LRT
+```{r}
+#Raw counts file
+GFP_counts <- read.table("~/Desktop/RNAseq/GFP_12Sept2024/rowdata/salmon.merged.gene_counts.tsv", header=TRUE, row.names=1)
+
+g2s <- data.frame(
+  gene_id = rownames(GFP_counts),
+  gene_name = GFP_counts[, 1]
+)
+
+View(g2s)
+
+# Remove gene name column for future use in DESEQ2
+GFP_counts_matrix <-GFP_counts[, -1] 
+
+# Round counts to integer mode required for DESEQ2
+GFP_counts_integer <- round(GFP_counts_matrix)
+
+View(GFP_counts_matrix)
+View(GFP_counts_integer)
+
+GFP_deseq_samples <- data.frame(
+  sample_id = colnames(GFP_counts_matrix))
+
+split_values <- strsplit(GFP_deseq_samples$sample_id, "_")
+
+View(split_values)
+# So here we will go through each row of split_values and run a "generic function(x)" 
+# We will then retain the second item which is the time point value in sample_id
+time_values <- sapply(split_values, function(x) x[[2]])
+
+# Similar to above we are using apply to grab the third fragment in split_values (replicate value)
+replicate_values <- sapply(split_values, function(x) x[[3]])
+
+# Adding replicate and time point into samplesheet for DESEQ2
+GFP_deseq_samples$time_point <- time_values
+
+# Now let's add another column for replicate
+GFP_deseq_samples$replicate <- replicate_values
+
+View(GFP_deseq_samples)
+
+#facotring timepoint column
+GFP_deseq_samples$replicate <- factor(GFP_deseq_samples$replicate, levels = c("1", "2", "3"))
+GFP_deseq_samples$time_point <- factor(GFP_deseq_samples$time_point, levels = c("0", "2", "4", "8", "16", "24", "48", "96"))
+levels(GFP_deseq_samples$time_point)
+```
+
+```{r}
+stopifnot(all(colnames(GFP_counts_integer) == GFP_deseq_samples$sample_id))
+
+GFP_dds <- DESeqDataSetFromMatrix(countData = GFP_counts_integer,
+                              colData = GFP_deseq_samples,
+                              design = ~ time_point)
+
+
+GFP_dds <- DESeq(GFP_dds,  test = "LRT", reduced = ~ 1)
+
+```
+
+```{r}
+
+resultsNames(GFP_dds)
+
+result_names <- resultsNames(GFP_dds)
+
+results_names <- result_names[-1]
+print(results_names)
+
+GFP_res_df <- data.frame("gene_id" = character(), 
+                     "baseMean" = numeric(), 
+                     "log2FoldChange" = numeric(), 
+                     "lfcSE" = numeric(),
+                     "stat" = numeric(),
+                     "pvalue" = numeric(),
+                     "padj" = numeric(),
+                     "gene_name" = character(),
+                     "result_name" = character())
+
+# For loop to get all results per time point  
+
+for(i in 1:length(results_names)) {
+  results_name <- results_names[i]
+  res <- results(GFP_dds, name = results_name)
+  tmp_res_df <- res %>% as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    merge(g2s) %>%
+    mutate(result_name = results_name,
+           timepoint = as.numeric(sub("time_point_([0-9]+)_vs_0", "\\1", results_name)))
+  GFP_res_df <- dplyr::bind_rows(GFP_res_df, tmp_res_df)
+  
+}
+  
+  GFP_res_df_padj0.05 <- GFP_res_df %>% 
+  filter(padj <= 0.05)
+  print(length(unique(GFP_res_df_padj0.05$gene_id)))
+  
+    time_point_2_values <- GFP_res_df_padj0.05 %>%
+  filter(result_name == "time_point_2_vs_0") %>%
+  select(gene_name, log2FoldChange)
+  
+GFP_res_df_padj0.05 <- GFP_res_df_padj0.05 %>%
+  mutate(
+    up = log2FoldChange > log2FoldChange[result_name == "time_point_2_vs_0"] & padj < 0.05,
+    down = log2FoldChange < log2FoldChange[result_name == "time_point_2_vs_0"] & padj < 0.05
+  )
+# Define the relevant time points
+valid_time_points <- c(8, 16, 24, 48, 96) 
+
+# Filter the data to include only the valid time points
+GFP_res_df_padj0.05_filtered <- GFP_res_df_padj0.05 %>%
+  filter(timepoint %in% valid_time_points)
+
+# Create a summary table to count up and down regulations per gene across time points
+trend_summary <- GFP_res_df_padj0.05_filtered %>%
+  group_by(gene_id) %>%
+  summarize(
+    up_count = sum(up, na.rm = TRUE),   # Count TRUE in 'up' for each gene
+    down_count = sum(down, na.rm = TRUE), # Count TRUE in 'down' for each gene
+    total_comparisons = n()  # Total number of time points per gene
+  ) %>%
+  filter(total_comparisons == length(valid_time_points))  # Ensure all time points are considered
+
+# Filter for significant up counts from the specific time points (at least 5 time points)
+GFP_res_df_padj0.05_up <- trend_summary %>%
+  filter(up_count >= 5)
+#3948
+
+# Filter for significant down counts from the specific time points (at least 5 time points)
+GFP_res_df_padj0.05_down <- trend_summary %>%
+  filter(down_count >= 5)
+#4155  
+save(GFP_res_df, GFP_res_df_padj0.05, file = "~/Desktop/RNAseq/GFP_12Sept2024/results/GFP_res_df.RData")
+```
+
+```{r}
+GFP_res_df_padj0.05 <- GFP_res_df_padj0.05 %>%
+  mutate(
+    up = log2FoldChange >= 0.58 & padj < 0.05,
+    down = log2FoldChange <= -0.58 & padj < 0.05
+  )
+# Define the relevant time points
+valid_time_points <- c(16, 24, 48, 96)
+# Filter the data to include only the valid time points
+GFP_res_df_padj0.05_filtered <- GFP_res_df_padj0.05 %>%
+  filter(timepoint %in% valid_time_points)
+# Create a summary table to count up and down regulations per gene across time points
+trend_summary <- GFP_res_df_padj0.05_filtered %>%
+  group_by(gene_id) %>%
+  dplyr::summarize(
+    up_count = sum(up, na.rm = TRUE),   # Count TRUE in 'up' for each gene
+    down_count = sum(down, na.rm = TRUE), # Count TRUE in 'down' for each gene
+    total_comparisons = n()  # Total number of time points per gene
+  ) %>%
+  filter(total_comparisons == length(valid_time_points))  # Ensure all time points are considered
+# Filter for significant up counts from the specific time points (at least 5 time points)
+GFP_res_df_padj0.05_up <- trend_summary %>%
+  filter(up_count >= 1)
+#3190
+# Filter for significant down counts from the specific time points (at least 5 time points)
+GFP_res_df_padj0.05_down <- trend_summary %>%
+  filter(down_count >= 1)
+#2270
+```
+
+#LINC00667 LRT
+```{r}
+#Raw counts file
+LINC00667_counts <- read.table("~/Desktop/RNAseq/LINC00667/rowdata/salmon.merged.gene_counts.tsv", header=TRUE, row.names=1)
+
+# Remove gene name column for future use in DESEQ2
+LINC00667_counts_matrix <-LINC00667_counts[, -1] 
+
+# Round counts to integer mode required for DESEQ2
+LINC00667_counts_integer <- round(LINC00667_counts_matrix)
+
+View(LINC00667_counts_matrix)
+View(LINC00667_counts_integer)
+
+LINC00667_deseq_samples <- data.frame(
+  sample_id = colnames(LINC00667_counts_matrix))
+
+split_values <- strsplit(LINC00667_deseq_samples$sample_id, "_")
+
+View(split_values)
+# So here we will go through each row of split_values and run a "generic function(x)" 
+# We will then retain the second item which is the time point value in sample_id
+time_values <- sapply(split_values, function(x) x[[2]])
+
+# Similar to above we are using apply to grab the third fragment in split_values (replicate value)
+replicate_values <- sapply(split_values, function(x) x[[3]])
+
+# Adding replicate and time point into samplesheet for DESEQ2
+LINC00667_deseq_samples$time_point <- time_values
+
+# Now let's add another column for replicate
+LINC00667_deseq_samples$replicate <- replicate_values
+
+#facotring timepoint column
+LINC00667_deseq_samples$replicate <- factor(LINC00667_deseq_samples$replicate, levels = c("1", "2", "3"))
+LINC00667_deseq_samples$time_point <- factor(LINC00667_deseq_samples$time_point, levels = c("0", "2", "4", "8", "16", "24", "48", "96"))
+levels(LINC00667_deseq_samples$time_point)
+
+View(LINC00667_deseq_samples)
+```
+
+```{r}
+stopifnot(all(colnames(LINC00667_counts_integer) == LINC00667_deseq_samples$sample_id))
+
+LINC00667_dds <- DESeqDataSetFromMatrix(countData = LINC00667_counts_integer,
+                              colData = LINC00667_deseq_samples,
+                              design = ~ time_point)
+
+
+LINC00667_dds <- DESeq(LINC00667_dds,  test = "LRT", reduced = ~ 1)
+
+```
+
+```{r}
+
+resultsNames(LINC00667_dds)
+
+result_names <- resultsNames(LINC00667_dds)
+
+results_names <- result_names[-1]
+print(results_names)
+
+LINC00667_res_df <- data.frame("gene_id" = character(), 
+                     "baseMean" = numeric(), 
+                     "log2FoldChange" = numeric(), 
+                     "lfcSE" = numeric(),
+                     "stat" = numeric(),
+                     "pvalue" = numeric(),
+                     "padj" = numeric(),
+                     "gene_name" = character(),
+                     "result_name" = character())
+
+# For loop to get all results per time point  
+
+for(i in 1:length(results_names)) {
+  results_name <- results_names[i]
+  res <- results(LINC00667_dds, name = results_name)
+  tmp_res_df <- res %>% as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    merge(g2s) %>%
+    mutate(result_name = results_name,
+           timepoint = as.numeric(sub("time_point_([0-9]+)_vs_0", "\\1", results_name)))
+  LINC00667_res_df <- dplyr::bind_rows(LINC00667_res_df, tmp_res_df)
+  
+}
+  # Calculate the maximum fold-change in any one timepoint
+  LINC00667_maxfc <- LINC00667_res_df %>%
+    group_by(gene_id) %>%
+    summarize(max_fc = max(abs(log2FoldChange))) 
+  
+  # merge max shrnklfc into dataframe
+  LINC00667_res_df <- LINC00667_res_df %>%
+    left_join(LINC00667_maxfc)
+  
+  LINC00667_res_df_padj0.05 <- LINC00667_res_df %>% 
+  filter(padj <= 0.05)
+  print(length(unique(LINC00667_res_df_padj0.05$gene_id)))
+  #14566
+  LINC00667_sig <- LINC00667_res_df_padj0.05 %>%
+  filter(max_fc >= 1)
+  print(length(unique(LINC00667_sig$gene_id)))
+  #4513
+```
+
+```{r}
+LINC00667_sig <- LINC00667_sig %>%
+  mutate(
+    up = log2FoldChange >= 0 & padj < 0.05,
+    down = log2FoldChange <= 0 & padj < 0.05
+  )
+# Define the relevant time points
+valid_time_points <- c(8, 16, 24, 48, 96)
+
+# Filter the data to include only the valid time points
+LINC00667_sig_filtered <- LINC00667_sig %>%
+  filter(timepoint %in% valid_time_points)
+
+# Create a summary table to count up and down regulations per gene across time points
+trend_summary <- LINC00667_sig_filtered %>%
+  group_by(gene_id) %>%
+  summarize(
+    up_count = sum(up, na.rm = TRUE),   # Count TRUE in 'up' for each gene
+    down_count = sum(down, na.rm = TRUE), # Count TRUE in 'down' for each gene
+    total_comparisons = n()  # Total number of time points per gene
+  ) %>%
+  filter(total_comparisons == length(valid_time_points))  # Ensure all time points are considered
+
+# Filter for significant up counts from the specific time points (at least 5 time points)
+LINC00667_sig_up <- trend_summary %>%
+  filter(up_count >= 5)
+
+# Filter for significant down counts from the specific time points (at least 5 time points)
+LINC00667_sig_down <- trend_summary %>%
+  filter(down_count >= 5)
+
+# Merge back to get the log2FoldChange for plotting
+LINC00667_sig <- LINC00667_sig %>%
+  filter(gene_id %in% c(LINC00667_sig_up$gene_id, LINC00667_sig_down$gene_id))
+
+# Count the unique number of genes
+length(unique(LINC00667_sig$gene_id)) 
+#2344
+```
+
+```{r}
+  time_point_2_values <- LINC00667_sig %>%
+  filter(result_name == "time_point_2_vs_0") %>%
+  select(gene_name, log2FoldChange)
+  
+LINC00667_sig <- LINC00667_sig %>%
+  mutate(
+    up = log2FoldChange > log2FoldChange[result_name == "time_point_2_vs_0"] & padj < 0.05,
+    down = log2FoldChange < log2FoldChange[result_name == "time_point_2_vs_0"] & padj < 0.05
+  )
+# Define the relevant time points
+valid_time_points <- c(8, 16, 24, 48, 96) 
+
+# Filter the data to include only the valid time points
+LINC00667_sig_filtered <- LINC00667_sig %>%
+  filter(timepoint %in% valid_time_points)
+
+# Create a summary table to count up and down regulations per gene across time points
+trend_summary <- LINC00667_sig_filtered %>%
+  group_by(gene_id) %>%
+  summarize(
+    up_count = sum(up, na.rm = TRUE),   # Count TRUE in 'up' for each gene
+    down_count = sum(down, na.rm = TRUE), # Count TRUE in 'down' for each gene
+    total_comparisons = n()  # Total number of time points per gene
+  ) %>%
+  filter(total_comparisons == length(valid_time_points))  # Ensure all time points are considered
+
+# Filter for significant up counts from the specific time points (at least 5 time points)
+LINC00667_sig_up <- trend_summary %>%
+  filter(up_count >= 5)
+
+# Filter for significant down counts from the specific time points (at least 5 time points)
+LINC00667_sig_down <- trend_summary %>%
+  filter(down_count >= 5)
+
+# Merge back to get the log2FoldChange for plotting
+LINC00667_trend_sig <- LINC00667_sig %>%
+  filter(gene_id %in% c(LINC00667_sig_up$gene_id, LINC00667_sig_down$gene_id))
+print(length(unique(LINC00667_trend_sig$gene_id)))
+#1795
+save(LINC00667_res_df, LINC00667_res_df_padj0.05, LINC00667_sig, file = "~/Desktop/RNAseq/LINC00667/results/LINC00667_res_df.RData")
+```
+
+
+```{r}
+LINC00667_trend_sig <- LINC00667_trend_sig %>%
+  mutate(
+    sig_up = log2FoldChange >= 0.58 & padj < 0.05,
+    sig_down = log2FoldChange <= -0.58 & padj < 0.05
+  )
+# Define the relevant time points
+valid_time_points_2 <- c(16, 24, 48, 96) 
+
+# Filter the data to include only the valid time points
+LINC00667_trend_sig_filtered <- LINC00667_trend_sig %>%
+  filter(timepoint %in% valid_time_points_2)
+
+# Create a summary table to count up and down regulations per gene across time points
+trend_summary <- LINC00667_trend_sig_filtered %>%
+  group_by(gene_id) %>%
+  summarize(
+    sig_up_count = sum(sig_up, na.rm = TRUE),   # Count TRUE in 'up' for each gene
+    sig_down_count = sum(sig_down, na.rm = TRUE), # Count TRUE in 'down' for each gene
+    total_comparisons = n()  # Total number of time points per gene
+  ) %>%
+  filter(total_comparisons == length(valid_time_points_2))  # Ensure all time points are considered
+
+# Filter for significant up counts from the specific time points (at least 5 time points)
+LINC00667_trend_sig_up <- trend_summary %>%
+  filter(sig_up_count >= 3)
+
+LINC00667_trend_sig_up_filtered <- LINC00667_trend_sig_up %>%
+  filter(gene_id %in% LINC00667_trend_sig_up$gene_id)
+#684
+LINC00667_trend_sig_up_filtered <- LINC00667_trend_sig_up %>%
+  filter(!gene_id %in% GFP_res_df_padj0.05_up$gene_id)
+#261
+
+# Filter for significant down counts from the specific time points (at least 5 time points)
+LINC00667_trend_sig_down <- trend_summary %>%
+  filter(sig_down_count >= 3)
+
+LINC00667_trend_sig_down_filtered <- LINC00667_trend_sig_down %>%
+  filter(gene_id %in% LINC00667_trend_sig_down$gene_id)
+#829
+LINC00667_trend_sig_down_filtered <- LINC00667_trend_sig_down %>%
+  filter(!gene_id %in% GFP_res_df_padj0.05_down$gene_id)
+#259
+
+LINC00667_trend_sig_filtered <- LINC00667_trend_sig %>%
+  filter(gene_id %in% c(LINC00667_trend_sig_up_filtered$gene_id, LINC00667_trend_sig_down_filtered$gene_id))
+
+print(length(unique(LINC00667_trend_sig_filtered$gene_id)))
+#520
+```
+
+#LINC00667 sig gene TPM plot
+```{r}
+#for time model
+# Load TPM data for LINC00667
+tpm_LINC00667 <- read.table("~/Desktop/RNAseq/LINC00667/rowdata/salmon.merged.gene_tpm.tsv", header=TRUE, row.names=1)
+
+# Load TPM data for LINC00667
+tpm_GFP <- read.table("~/Desktop/RNAseq/GFP_12Sept2024/rowdata/salmon.merged.gene_tpm.tsv", header=TRUE, row.names=1)
+
+# Summarize mean TPM for each gene at each time point
+mean_tpm_per_time <- tpm_LINC00667 %>%
+  pivot_longer(cols = starts_with("LINC00667_"), 
+               names_to = c("time_point", "replicate"),
+               names_pattern = "LINC00667_(\\d+)_(\\d+)",
+               values_to = "TPM") %>%
+  group_by(gene_name, time_point) %>%
+  summarize(mean_TPM = mean(TPM, na.rm = TRUE), .groups = "drop")
+
+# Identify genes where all time points have mean TPM < 0.5
+genes_to_exclude <- mean_tpm_per_time %>%
+  group_by(gene_name) %>%
+  summarize(all_below_threshold = all(mean_TPM < 0.5), .groups = "drop") %>%
+  filter(all_below_threshold) %>%
+  pull(gene_name)
+
+# Exclude these genes from your filtered dataset
+LINC00667_trend_sig_filtered <- LINC00667_trend_sig_filtered %>%
+  filter(!(gene_name %in% genes_to_exclude))
+
+# Check the number of unique genes remaining
+length(unique(LINC00667_trend_sig_filtered$gene_name))
+#343
+
+# Filter the TPM data for genes in sig_LINC00667_LRT_shrnklfc
+filtered_tpm_LINC00667 <- tpm_LINC00667[tpm_LINC00667$gene_name %in% LINC00667_trend_sig_filtered$gene_name, ]
+filtered_tpm_GFP <- tpm_GFP[tpm_GFP$gene_name %in% LINC00667_trend_sig_filtered$gene_name, ]
+
+# Reshape LINC00667 TPM data to long format
+tpm_long_LINC00667 <- filtered_tpm_LINC00667 %>%
+  pivot_longer(
+    cols = starts_with("LINC00667"),
+    names_to = c("time_point", "replicate"),
+    names_pattern = "^LINC00667_(\\d+)_(\\d+)$",
+    values_to = "tpm"
+  ) %>%
+  mutate(
+    time_point = as.numeric(time_point),
+    replicate = as.numeric(replicate),
+    condition = "LINC00667"  # Add a column to label as LINC00667
+  )
+
+# Reshape GFP TPM data to long format
+tpm_long_GFP <- filtered_tpm_GFP %>%
+  pivot_longer(
+    cols = starts_with("GFP"),
+    names_to = c("time_point", "replicate"),
+    names_pattern = "^GFP_(\\d+)_(\\d+)$",
+    values_to = "tpm"
+  ) %>%
+  mutate(
+    time_point = as.numeric(time_point),
+    replicate = as.numeric(replicate),
+    condition = "GFP"  # Add a column to label as GFP
+  )
+
+# Combine LINC00667 and GFP data into one data frame
+tpm_combined_long <- bind_rows(tpm_long_LINC00667, tpm_long_GFP)
+
+# Calculate mean and standard error (SE) for TPM at each time point and condition
+tpm_mean_combined <- tpm_combined_long %>%
+  group_by(gene_name, time_point, condition) %>%
+  summarise(
+    mean_tpm = mean(tpm, na.rm = TRUE),
+    se_tpm = sd(tpm, na.rm = TRUE) / sqrt(n()),  # Standard error
+    .groups = 'drop'
+  )
+
+# Plot the combined TPM values for LINC00667 and GFP with error bars
+ggplot(tpm_mean_combined, aes(x = time_point, y = mean_tpm, group = interaction(gene_name, condition))) +
+  geom_line(aes(color = condition), alpha = 0.7) +  # Line colored by condition
+  geom_point(aes(color = condition), alpha = 0.5) +  # Points for each mean TPM value
+  geom_errorbar(
+    aes(ymin = mean_tpm - se_tpm, ymax = mean_tpm + se_tpm, color = condition),
+    width = 0.2, # Adjust the width of the error bars
+    alpha = 0.7
+  ) +
+  facet_wrap(~ gene_name, scales = "free_y") +  # Separate plots for each gene
+  labs(
+    x = "Time Point (h)", 
+    y = "Mean TPM", 
+    color = "Condition"
+  ) +
+  theme_minimal() +  # Minimal theme
+  scale_color_manual(values = c("LINC00667" = "red", "GFP" = "darkgreen")) +  # Manual color scale
+  scale_x_continuous(breaks = unique(tpm_mean_combined$time_point))  # Set x-axis breaks
+
+# Save the plot
+ggsave(
+  path = "~/Desktop/RNAseq/LINC00667/figures/",
+  filename = "LINC00667_GFP_sig_TPM_individule_v3_with_errorbars.pdf",
+  height = 50, width = 60, limitsize = FALSE
+)
+```
+
+#LINC00667 sig gene LFC plot
+```{r}
+# Filter genes from GFP_res_df that are present in LINC00667_trend_sig_filtered
+filtered_GFP_res <- GFP_res_df %>%
+  filter(gene_id %in% LINC00667_trend_sig_filtered$gene_id) %>%
+  mutate(source = "GFP")
+
+# Add a 0 time_point for GFP data
+filtered_GFP_res_zero <- filtered_GFP_res %>%
+  dplyr::select(gene_id, gene_name, baseMean) %>%
+  distinct() %>%
+  mutate(log2FoldChange = 0,
+         timepoint = 0,
+         source = "GFP")
+
+filtered_GFP_res <- filtered_GFP_res %>%
+  bind_rows(filtered_GFP_res_zero)
+
+# Prepare LINC00667 data with source column
+LINC00667_trend_sig_filtered <- LINC00667_trend_sig_filtered %>%
+  mutate(source = "LINC00667")
+
+# Add a 0 time_point for LINC00667
+LINC00667_trend_sig_filtered_zero <- LINC00667_trend_sig_filtered %>%
+  dplyr::select(gene_id, gene_name, baseMean) %>%
+  distinct() %>%
+  mutate(log2FoldChange = 0,
+         timepoint = 0,
+         source = "LINC00667")
+
+LINC00667_trend_sig_filtered <- LINC00667_trend_sig_filtered %>%
+  bind_rows(LINC00667_trend_sig_filtered_zero)
+
+# Combine LINC00667 and filtered GFP data
+combined_data <- bind_rows(LINC00667_trend_sig_filtered, filtered_GFP_res)
+
+# Generate the plot
+ggplot(combined_data, aes(x = timepoint, y = log2FoldChange, group = interaction(gene_id, source), color = source)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(alpha = 0.7, aes(linetype = source)) +
+  geom_point(alpha = 0.8) +
+  facet_wrap(~gene_name, scales = "free_y") +
+  scale_color_manual(values = c("LINC00667" = "red", "GFP" = "darkgreen")) +
+  scale_x_continuous(breaks = c(0, 2, 4, 8, 16, 24, 48, 96), labels = c("0", "2", "4", "8", "16", "24", "48", "96")) +
+  theme_minimal() +
+  labs(title = "Gene LFC Trends for LINC00667 and GFP",
+       x = "Timepoint (hours)",
+       y = "Log2 Fold Change",
+       color = "Source",
+       linetype = "Source")
+
+# Save the plot
+ggsave(path = "~/Desktop/RNAseq/LINC00667/figures/", 
+       filename = "LINC00667_vs_GFP_trend_sig_lfc_individule.pdf", 
+       height = 50, width = 60, limitsize = FALSE)
+
+```
+
+#LINC00667 sig gene counts plot
+```{r}
+# Load counts data for LINC00667
+counts_LINC00667 <- read.table("~/Desktop/RNAseq/LINC00667/rowdata/salmon.merged.gene_counts.tsv", header=TRUE, row.names=1)
+
+# Load counts data for LINC00667
+counts_GFP <- read.table("~/Desktop/RNAseq/GFP_12Sept2024/rowdata/salmon.merged.gene_counts.tsv", header=TRUE, row.names=1)
+
+# Filter the counts data for genes in sig_LINC00667_LRT_shrnklfc
+filtered_counts_LINC00667 <- counts_LINC00667[counts_LINC00667$gene_name %in% LINC00667_trend_sig_filtered$gene_name, ]
+filtered_counts_GFP <- counts_GFP[counts_GFP$gene_name %in% LINC00667_trend_sig_filtered$gene_name, ]
+
+# Reshape LINC00667 counts data to long format
+counts_long_LINC00667 <- filtered_counts_LINC00667 %>%
+  pivot_longer(
+    cols = starts_with("LINC00667"),
+    names_to = c("time_point", "replicate"),
+    names_pattern = "^LINC00667_(\\d+)_(\\d+)$",
+    values_to = "counts"
+  ) %>%
+  mutate(
+    time_point = as.numeric(time_point),
+    replicate = as.numeric(replicate),
+    condition = "LINC00667"  # Add a column to label as LINC00667
+  )
+
+# Reshape GFP counts data to long format
+counts_long_GFP <- filtered_counts_GFP %>%
+  pivot_longer(
+    cols = starts_with("GFP"),
+    names_to = c("time_point", "replicate"),
+    names_pattern = "^GFP_(\\d+)_(\\d+)$",
+    values_to = "counts"
+  ) %>%
+  mutate(
+    time_point = as.numeric(time_point),
+    replicate = as.numeric(replicate),
+    condition = "GFP"  # Add a column to label as GFP
+  )
+
+# Combine LINC00667 and GFP data into one data frame
+counts_combined_long <- bind_rows(counts_long_LINC00667, counts_long_GFP)
+
+# Calculate mean and standard error (SE) for counts at each time point and condition
+counts_mean_combined <- counts_combined_long %>%
+  group_by(gene_name, time_point, condition) %>%
+  summarise(
+    mean_counts = mean(counts, na.rm = TRUE),
+    se_counts = sd(counts, na.rm = TRUE) / sqrt(n()),  # Standard error
+    .groups = 'drop'
+  )
+
+# Plot the combined counts values for LINC00667 and GFP with error bars
+ggplot(counts_mean_combined, aes(x = time_point, y = mean_counts, group = interaction(gene_name, condition))) +
+  geom_line(aes(color = condition), alpha = 0.7) +  # Line colored by condition
+  geom_point(aes(color = condition), alpha = 0.5) +  # Points for each mean counts value
+  geom_errorbar(
+    aes(ymin = mean_counts - se_counts, ymax = mean_counts + se_counts, color = condition),
+    width = 0.2, # Adjust the width of the error bars
+    alpha = 0.7
+  ) +
+  facet_wrap(~ gene_name, scales = "free_y") +  # Separate plots for each gene
+  labs(
+    x = "Time Point (h)", 
+    y = "Mean counts", 
+    color = "Condition"
+  ) +
+  theme_minimal() +  # Minimal theme
+  scale_color_manual(values = c("LINC00667" = "red", "GFP" = "darkgreen")) +  # Manual color scale
+  scale_x_continuous(breaks = unique(counts_mean_combined$time_point))  # Set x-axis breaks
+
+# Save the plot
+ggsave(
+  path = "~/Desktop/RNAseq/LINC00667/figures/",
+  filename = "LINC00667_GFP_sig_counts_individule_with_errorbars.pdf",
+  height = 50, width = 60, limitsize = FALSE
+)
+```
+
