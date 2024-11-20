@@ -1,0 +1,76 @@
+---
+title: "LINC00667_Sig_Gene_Plot"
+author: "ML"
+date: "2024-11_19"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+library(gridExtra)
+library(ggplot2)
+library(dplyr)
+# Define the list of genes to plot
+genes_to_plot <- c("CRABP2", "DRD4", "ENO3", "ERICH2", "ETV5", "FRY", "FYB2", 
+                   "GAD1", "GCNT1", "HTR1D", "KREMEN2", "LEFTY1", "LIX1", 
+                   "PAPLN", "PLA2G4C", "SDHAP3", "SOWAHC", "SSBP2", "WNT4")
+
+# Filter data for the selected genes
+tpm_filtered <- tpm_mean_combined %>% filter(gene_name %in% genes_to_plot)
+counts_filtered <- counts_mean_combined %>% filter(gene_name %in% genes_to_plot)
+lfc_filtered <- combined_data %>% filter(gene_name %in% genes_to_plot)
+
+# Function to create individual plots
+create_plots <- function(genes_subset) {
+  plots <- lapply(genes_subset, function(gene) {
+    # TPM plot
+    p1 <- ggplot(tpm_filtered %>% filter(gene_name == gene), 
+                 aes(x = time_point, y = mean_tpm, color = condition)) +
+      geom_line() +
+      geom_point() +
+      geom_errorbar(aes(ymin = mean_tpm - se_tpm, ymax = mean_tpm + se_tpm), width = 0.2) +
+      scale_color_manual(values = c("LINC00667" = "red", "GFP" = "darkgreen")) +
+      labs(title = paste(gene, "TPM"), x = "Time Point (h)", y = "Mean TPM") +
+      theme_minimal()
+    
+    # Counts plot
+    p2 <- ggplot(counts_filtered %>% filter(gene_name == gene), 
+                 aes(x = time_point, y = mean_counts, color = condition)) +
+      geom_line() +
+      geom_point() +
+      geom_errorbar(aes(ymin = mean_counts - se_counts, ymax = mean_counts + se_counts), width = 0.2) +
+      scale_color_manual(values = c("LINC00667" = "red", "GFP" = "darkgreen")) +
+      labs(title = paste(gene, "Counts"), x = "Time Point (h)", y = "Mean Counts") +
+      theme_minimal()
+    
+    # log2FoldChange plot
+    p3 <- ggplot(lfc_filtered %>% filter(gene_name == gene), 
+                 aes(x = timepoint, y = log2FoldChange, color = source)) +
+      geom_line() +
+      geom_point() +
+      scale_color_manual(values = c("LINC00667" = "red", "GFP" = "darkgreen")) +
+      labs(title = paste(gene, "log2FoldChange"), x = "Time Point (h)", y = "log2FoldChange") +
+      theme_minimal()
+    
+    list(p1, p2, p3)  # Return all three plots for the gene
+  })
+  
+  do.call(c, plots)  # Combine all plots into a single list
+}
+
+# Generate all plots
+all_plots <- create_plots(genes_to_plot)
+
+# Arrange plots in pages with 9 plots (3 genes x 3 metrics) per page
+# Open the PDF with a horizontal layout
+pdf("~/Desktop/RNAseq/LINC00667/figures/LINC00667_GFP_TPM_Counts_LFC.pdf", height = 12, width = 24)
+
+# Arrange all plots in a grid on one page
+grid.arrange(grobs = all_plots, ncol = 9)  # Arrange all plots in a single grid with 9 columns
+
+# Close the PDF device
+dev.off()
+
+
+```
+
